@@ -50,8 +50,14 @@ OUT_DIR="${OUTPUT_ROOT}/${TRAJ}"    # all outputs go here
 HLOC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ── Input paths ───────────────────────────────────────────────────────────────
-VRS_FILE="${TRAJ_DIR}/trimmed_vrs/leader_trimmed.vrs"
-MPS_DIR="${TRAJ_DIR}/mps_leader_trimmed_vrs/slam"
+# VRS_FILE="${TRAJ_DIR}/trimmed_vrs/leader_trimmed.vrs"
+# MPS_DIR="${TRAJ_DIR}/mps_leader_trimmed_vrs/slam"
+# TRAJECTORY_CSV="${MPS_DIR}/closed_loop_trajectory.csv"
+# ONLINE_CALIB="${MPS_DIR}/online_calibration.jsonl"
+# SEMIDENSE_CSV="${MPS_DIR}/semidense_points.csv.gz"
+# BLK_IMG_DIR="${TRAJ_DIR}/blk/images"
+VRS_FILE="${TRAJ_DIR}/trimmed_vrs/helper_trimmed.vrs"
+MPS_DIR="${TRAJ_DIR}/multislam_output/helper_trimmed/slam"
 TRAJECTORY_CSV="${MPS_DIR}/closed_loop_trajectory.csv"
 ONLINE_CALIB="${MPS_DIR}/online_calibration.jsonl"
 SEMIDENSE_CSV="${MPS_DIR}/semidense_points.csv.gz"

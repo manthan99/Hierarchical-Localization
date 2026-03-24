@@ -59,6 +59,11 @@ def main():
     print("\nApplying coarse transform …")
     pcd_blk_in_aria = pcd_blk.transform(T_aria_from_blk)
 
+    # Save coarse-only aligned BLK (before ICP)
+    coarse_path = args.output_pcd.with_stem(args.output_pcd.stem + "_coarse")
+    o3d.io.write_point_cloud(str(coarse_path), pcd_blk_in_aria)
+    print(f"  Saved coarse-only BLK: {coarse_path}")
+
     # Downsample for ICP
     print(f"Downsampling at {args.voxel_size*100:.0f} cm …")
     blk_ds = pcd_blk_in_aria.voxel_down_sample(args.voxel_size)
@@ -74,10 +79,13 @@ def main():
     aria_ds.estimate_normals(
         o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=30))
 
-    # ICP: BLK (source) → Aria (target)
+    # ICP: Aria (source) → BLK (target)
+    # BLK is denser → better normals → use as target for point-to-plane.
+    # We get T that moves Aria→BLK, then invert to move BLK→Aria.
     print(f"Running point-to-plane ICP (threshold={args.icp_threshold} m) …")
+    print(f"  Source: Aria ({len(aria_ds.points):,} pts)  →  Target: BLK ({len(blk_ds.points):,} pts)")
     icp_result = o3d.pipelines.registration.registration_icp(
-        blk_ds, aria_ds,
+        aria_ds, blk_ds,       # Aria=source, BLK=target
         args.icp_threshold,
         np.eye(4),
         o3d.pipelines.registration.TransformationEstimationPointToPlane(),
@@ -88,23 +96,24 @@ def main():
         ),
     )
 
-    T_icp = icp_result.transformation
+    T_aria_to_blk = icp_result.transformation   # moves Aria → BLK
+    T_icp = np.linalg.inv(T_aria_to_blk)        # invert: correction for BLK → Aria
     fitness = icp_result.fitness
     inlier_rmse = icp_result.inlier_rmse
 
     print(f"\n  ICP Results:")
-    print(f"    Fitness:     {fitness:.4f} ({fitness*100:.1f}% of BLK points matched)")
+    print(f"    Fitness:     {fitness:.4f} ({fitness*100:.1f}% of Aria points matched)")
     print(f"    Inlier RMSE: {inlier_rmse:.4f} m ({inlier_rmse*100:.2f} cm)")
-    print(f"    ICP correction:")
+    print(f"    ICP correction (for BLK, inverted):")
     for row in T_icp:
         print(f"      [{row[0]:10.6f}, {row[1]:10.6f}, {row[2]:10.6f}, {row[3]:10.6f}]")
 
-    # Apply ICP refinement
+    # Apply ICP refinement to BLK
     pcd_blk_final = pcd_blk_in_aria.transform(T_icp)
 
-    # Save final aligned BLK
+    # Save ICP-refined aligned BLK
     o3d.io.write_point_cloud(str(args.output_pcd), pcd_blk_final)
-    print(f"\n  Saved aligned BLK: {args.output_pcd}")
+    print(f"\n  Saved aligned BLK (ICP-refined): {args.output_pcd}")
 
     # Compute final transform
     T_final = T_icp @ T_aria_from_blk
