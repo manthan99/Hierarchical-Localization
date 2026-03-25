@@ -329,53 +329,100 @@ def main():
     transforms = np.array(transforms)
     print(f"  Valid transforms: {len(transforms)}")
 
-    # Consistency: deviations from first
-    T_ref = transforms[0]
-    all_dt, all_dr = [], []
-    for T_i in transforms:
-        dT = np.linalg.inv(T_ref) @ T_i
-        all_dt.append(np.linalg.norm(dT[:3, 3]))
-        all_dr.append(rotation_angle_deg(dT[:3, :3]))
-    all_dt, all_dr = np.array(all_dt), np.array(all_dr)
+    if len(transforms) == 0:
+        print("  ERROR: No valid transforms found!")
+        return
 
-    # Inlier filtering
-    t_thresh = max(2 * np.median(all_dt), 1.0)
-    r_thresh = max(2 * np.median(all_dr), 5.0)
-    inlier_mask = (all_dt <= t_thresh) & (all_dr <= r_thresh)
-    n_inliers = inlier_mask.sum()
-    print(f"  Inliers: {n_inliers}/{len(transforms)} "
-          f"(dt<{t_thresh:.1f}m, dr<{r_thresh:.1f}°)")
+    # ── Physics-based filtering ──────────────────────────────────────────
+    # Both sensors are roughly upright, so T_aria_from_blk should be
+    # mostly yaw (rotation about gravity axis) + translation.
+    # Reject any transform with significant roll or pitch.
 
-    if n_inliers >= 3:
-        inlier_T = transforms[inlier_mask]
-        t_mean = inlier_T[:, :3, 3].mean(0)
-        quats = [Rot.from_matrix(T[:3, :3]).as_quat() for T in inlier_T]
-        quats = np.array(quats)
-        for i in range(1, len(quats)):
-            if np.dot(quats[i], quats[0]) < 0:
-                quats[i] = -quats[i]
-        q_mean = quats.mean(0)
-        q_mean /= np.linalg.norm(q_mean)
+    ROLL_PITCH_MAX = 2.0   # degrees – reject if roll or pitch exceeds this
+    T_CONSISTENCY  = 0.5    # metres – max translation deviation from median
+    R_CONSISTENCY  = 10.0   # degrees – max rotation deviation from median
 
-        T_best = np.eye(4, dtype=np.float64)
-        T_best[:3, :3] = Rot.from_quat(q_mean).as_matrix()
-        T_best[:3, 3] = t_mean
-    else:
-        T_best = T_ref
+    # Step A: Decompose each transform into Euler angles and reject bad roll/pitch
+    all_eulers = np.array([Rot.from_matrix(T[:3, :3]).as_euler('xyz', degrees=True)
+                           for T in transforms])  # Nx3: [roll, pitch, yaw]
 
-    euler = Rot.from_matrix(T_best[:3, :3]).as_euler('xyz', degrees=True)
+    roll_ok  = np.abs(all_eulers[:, 0]) < ROLL_PITCH_MAX
+    pitch_ok = np.abs(all_eulers[:, 1]) < ROLL_PITCH_MAX
+    physics_mask = roll_ok & pitch_ok
 
-    print(f"\n  Inlier stats:")
-    dt_in = all_dt[inlier_mask]
-    dr_in = all_dr[inlier_mask]
+    n_physics = physics_mask.sum()
+    print(f"\n  Physics filter (|roll|<{ROLL_PITCH_MAX}°, |pitch|<{ROLL_PITCH_MAX}°):")
+    print(f"    Passed: {n_physics}/{len(transforms)}")
+    if n_physics > 0:
+        print(f"    Roll  range: [{all_eulers[physics_mask, 0].min():.1f}°, {all_eulers[physics_mask, 0].max():.1f}°]")
+        print(f"    Pitch range: [{all_eulers[physics_mask, 1].min():.1f}°, {all_eulers[physics_mask, 1].max():.1f}°]")
+        print(f"    Yaw   range: [{all_eulers[physics_mask, 2].min():.1f}°, {all_eulers[physics_mask, 2].max():.1f}°]")
+
+    if n_physics < 3:
+        print(f"  WARNING: Only {n_physics} transforms passed physics filter, using all.")
+        physics_mask = np.ones(len(transforms), dtype=bool)
+
+    # Work only with physics-filtered transforms from here on
+    phys_T = transforms[physics_mask]
+    phys_eulers = np.array([Rot.from_matrix(T[:3, :3]).as_euler('xyz', degrees=True)
+                            for T in phys_T])
+
+    # Step B: Consistency filtering — median computed ONLY from physics-filtered set
+    t_median = np.median(phys_T[:, :3, 3], axis=0)
+    yaw_median = np.median(phys_eulers[:, 2])
+
+    dt_from_median = np.linalg.norm(phys_T[:, :3, 3] - t_median, axis=1)
+    dr_from_median = np.abs(phys_eulers[:, 2] - yaw_median)
+    dr_from_median = np.minimum(dr_from_median, 360.0 - dr_from_median)
+
+    consistency_mask = (dt_from_median <= T_CONSISTENCY) & (dr_from_median <= R_CONSISTENCY)
+    n_consistent = consistency_mask.sum()
+
+    print(f"\n  Consistency filter (Δt<{T_CONSISTENCY}m, Δyaw<{R_CONSISTENCY}°):")
+    print(f"    Median t: [{t_median[0]:.3f}, {t_median[1]:.3f}, {t_median[2]:.3f}]")
+    print(f"    Median yaw: {yaw_median:.1f}°")
+    print(f"    Inliers: {n_consistent}/{len(phys_T)}")
+
+    if n_consistent < 3:
+        print(f"  WARNING: Only {n_consistent} consistent transforms, relaxing to physics-only set.")
+        consistency_mask = np.ones(len(phys_T), dtype=bool)
+        n_consistent = len(phys_T)
+
+    inlier_T = phys_T[consistency_mask]
+
+    # Step C: Robust averaging (Markley eigenvector method for rotation)
+    t_mean = inlier_T[:, :3, 3].mean(0)
+
+    quats = np.array([Rot.from_matrix(T[:3, :3]).as_quat() for T in inlier_T])
+    # Flip quaternions to same hemisphere
+    for i in range(1, len(quats)):
+        if np.dot(quats[i], quats[0]) < 0:
+            quats[i] = -quats[i]
+    # Markley (2007): largest eigenvector of Q^T Q
+    M = quats.T @ quats  # 4×4
+    _, vecs = np.linalg.eigh(M)
+    q_mean = vecs[:, -1]  # eigenvector with largest eigenvalue
+
+    T_best = np.eye(4, dtype=np.float64)
+    T_best[:3, :3] = Rot.from_quat(q_mean).as_matrix()
+    T_best[:3, 3] = t_mean
+
+    euler_best = Rot.from_matrix(T_best[:3, :3]).as_euler('xyz', degrees=True)
+
+    # Step D: Report
+    dt_in = dt_from_median[consistency_mask]
+    dr_in = dr_from_median[consistency_mask]
+    print(f"\n  Inlier stats ({n_consistent} images):")
     print(f"    Δt: mean={dt_in.mean():.4f}, std={dt_in.std():.4f} m")
-    print(f"    Δr: mean={dr_in.mean():.4f}, std={dr_in.std():.4f}°")
+    print(f"    Δyaw: mean={dr_in.mean():.4f}, std={dr_in.std():.4f}°")
 
     print(f"\n{'=' * 70}")
     print("RESULT: T_ariaWorld_from_blkWorld")
     for row in T_best:
         print(f"  [{row[0]:12.8f}, {row[1]:12.8f}, {row[2]:12.8f}, {row[3]:12.8f}]")
-    print(f"  Euler (xyz): [{euler[0]:.2f}°, {euler[1]:.2f}°, {euler[2]:.2f}°]")
+    print(f"  Roll:  {euler_best[0]:.2f}°  (expect ~0)")
+    print(f"  Pitch: {euler_best[1]:.2f}°  (expect ~0)")
+    print(f"  Yaw:   {euler_best[2]:.2f}°")
     print(f"  Translation: [{T_best[0,3]:.4f}, {T_best[1,3]:.4f}, {T_best[2,3]:.4f}]")
 
     np.save(str(out / "T_ariaWorld_from_blkWorld.npy"), T_best)
